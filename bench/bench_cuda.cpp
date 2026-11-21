@@ -80,21 +80,23 @@ float max_abs_err(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 // Average milliseconds per call of a GPU launch sequence, measured with cudaEvents.
-double time_gpu(const std::function<void()>& fn) {
-  for (int i = 0; i < kWarmup; ++i) fn();
+// warmup/iters default to the module-wide constants; large square matmuls override
+// them with smaller counts so a single huge GEMM doesn't dominate the whole bench.
+double time_gpu(const std::function<void()>& fn, int warmup = kWarmup, int iters = kIters) {
+  for (int i = 0; i < warmup; ++i) fn();
   CUDA_CHECK(cudaDeviceSynchronize());
   cudaEvent_t start, stop;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
   CUDA_CHECK(cudaEventRecord(start, 0));
-  for (int i = 0; i < kIters; ++i) fn();
+  for (int i = 0; i < iters; ++i) fn();
   CUDA_CHECK(cudaEventRecord(stop, 0));
   CUDA_CHECK(cudaEventSynchronize(stop));
   float ms = 0.0f;
   CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
-  return (double)ms / kIters;
+  return (double)ms / iters;
 }
 
 // Milliseconds per call of a CPU function over `iters` repetitions (plus a warmup if iters > 1).
@@ -242,6 +244,71 @@ void bench_matmul(cublasHandle_t blas) {
   }
 }
 
+// Square GEMM cases, M = N = K, so the project can state a clean "tiled kernel reaches
+// X% of cuBLAS at N x N" number without the model-shaped cases' uneven dimensions.
+// The naive CPU GEMM above is ~5 GFLOP/s, so a 2048^3 CPU run is already a few seconds
+// and a 4096^3 one would be tens of seconds; the CPU reference is only run at N=1024
+// and skipped above that so the whole bench still finishes quickly. cuBLAS and the
+// tiled kernel run at every size, with fewer timed iterations at the largest sizes
+// (still enough to average out noise) so a single huge GEMM can't dominate the runtime.
+void bench_matmul_square(cublasHandle_t blas) {
+  struct Case {
+    int n;
+    bool with_cpu;
+    int warmup, iters;
+  };
+  const Case cases[] = {
+      {1024, true, kWarmup, kIters},
+      {2048, false, kWarmup, kIters},
+      {4096, false, 3, 10},
+      {8192, false, 2, 10},
+  };
+
+  std::printf("\n== matmul: square C[N,N] = A[N,N] W[N,N]^T, M=N=K  (rate = GFLOP/s) ==\n");
+  print_header("GFLOP/s");
+  for (const Case& c : cases) {
+    const int M = c.n, N = c.n, K = c.n;
+    const auto hA = random_vec((size_t)M * K);
+    const auto hW = random_vec((size_t)N * K);
+    DeviceBuffer dA = upload(hA);
+    DeviceBuffer dW = upload(hW);
+    DeviceBuffer dC((size_t)M * N);
+    DeviceBuffer dRef((size_t)M * N);
+    const double gflop = 2.0 * (double)M * N * K * 1e-9;
+    char nm[96];
+    std::snprintf(nm, sizeof nm, "square %dx%dx%d", M, N, K);
+
+    // CPU reference, only for the smallest size (see comment above).
+    std::vector<float> hCpu;
+    double cpu_ms = -1.0;
+    if (c.with_cpu) {
+      hCpu.resize((size_t)M * N);
+      cpu_ms = time_cpu([&] { cpu_gemm(hCpu.data(), hA.data(), hW.data(), nullptr, M, N, K); }, 1);
+    }
+    const bool have_cpu = cpu_ms >= 0;
+
+    // cuBLAS reference.
+    const double blas_ms =
+        time_gpu([&] { cublas_gemm(blas, dRef.get(), dA.get(), dW.get(), M, N, K); }, c.warmup,
+                 c.iters);
+    const auto hBlas = download(dRef);
+
+    // Hand-written tiled kernel, forced explicitly (not the M==1 matvec dispatch path).
+    tc::matmul_tiled(dC.get(), dA.get(), dW.get(), nullptr, M, N, K);
+    const float err_blas = max_abs_err(download(dC), hBlas);
+    const float err_cpu = have_cpu ? max_abs_err(download(dC), hCpu) : -1.0f;
+    const double ours_ms = time_gpu(
+        [&] { tc::matmul_tiled(dC.get(), dA.get(), dW.get(), nullptr, M, N, K); }, c.warmup,
+        c.iters);
+
+    if (have_cpu) {
+      print_row(nm, "cpu", cpu_ms, gflop / (cpu_ms * 1e-3), -1, -1);
+    }
+    print_row(nm, "cublas", blas_ms, gflop / (blas_ms * 1e-3), -1, -1);
+    print_row(nm, "tiled", ours_ms, gflop / (ours_ms * 1e-3), err_blas, err_cpu);
+  }
+}
+
 // ---- layernorm ----------------------------------------------------------------------
 
 void bench_layernorm() {
@@ -373,6 +440,7 @@ int main() {
   CUBLAS_CHECK(cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH));
 
   bench_matmul(blas);
+  bench_matmul_square(blas);
   bench_layernorm();
   bench_softmax();
   bench_attention();
