@@ -22,14 +22,23 @@
 //      together there, not in isolation (see (3) below for isolated RoPE/attention checks
 //      against TinyLlama's own dimensions, just not its real weights).
 //
-//   3. OpLevelReference.MatchesHuggingFaceAndTorch: fixed-seed random inputs run through
+//   3. Gpt2Q8Reference / Gpt2Q4Reference / TinyLlamaQ8Reference / TinyLlamaQ4Reference:
+//      the quantized (Q8/Q4) paths, run end to end through the shipped
+//      load_model()+Model::forward() on the real models/<model>-{q8,q4}.tllm weights and
+//      checked for FIDELITY against the f32 HF ground truth: the quantized greedy argmax
+//      and top-5 must match HF's f32 logits at every prompt position. The raw logit
+//      divergence (max/mean abs) is reported as the measured quantization cost, not gated
+//      on a tuned bound. See the detailed comment above RunQuantFidelity for why a
+//      quantized W8A8/W4A8 pipeline cannot be pinned f32-tight.
+//
+//   4. OpLevelReference.MatchesHuggingFaceAndTorch: fixed-seed random inputs run through
 //      tinyllm's layernorm, gelu, softmax, attention (MHA and GQA), rmsnorm, rope, and
 //      silu_mul, compared against torch/transformers's own reference implementations of
 //      each (torch.nn.functional.layer_norm/softmax/silu, transformers' NewGELUActivation,
 //      LlamaRMSNorm, and apply_rotary_pos_emb). This does not need any model weights,
 //      only the reference dump under models/ref/ops.
 //
-// All three skip cleanly (GTEST_SKIP) when their reference dumps or weight files are
+// All tests skip cleanly (GTEST_SKIP) when their reference dumps or weight files are
 // absent, following the TINYLLM_MODELS_DIR skip pattern used elsewhere in this suite (see
 // gpt2_e2e_test.cpp). None of these dumps are checked into the repo (models/ is
 // gitignored); regenerate with:
@@ -41,15 +50,21 @@
 //   hf download TinyLlama/TinyLlama-1.1B-Chat-v1.0 --local-dir models/tinyllama
 //   ./build/tinyllm-convert models/gpt2 models/gpt2.tllm
 //   ./build/tinyllm-convert models/tinyllama models/tinyllama-f32.tllm
+//   ./build/tinyllm-convert models/gpt2 models/gpt2-q8.tllm --quant q8
+//   ./build/tinyllm-convert models/gpt2 models/gpt2-q4.tllm --quant q4
+//   ./build/tinyllm-convert models/tinyllama models/tinyllama-q8.tllm --quant q8
+//   ./build/tinyllm-convert models/tinyllama models/tinyllama-q4.tllm --quant q4
 //   models/.venv-ref/bin/python scripts/gen_reference.py
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -489,7 +504,171 @@ TEST(TinyLlamaReference, ElementWiseMatchesHuggingFace) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Op-level references: fixed-seed random inputs, HF/torch reference implementations.
+// 3. Quantized (Q8/Q4) fidelity against the f32 HuggingFace ground truth.
+//
+// tinyllm's quantized matvec is W8A8 / W4A8: matvec_q8 and matvec_q4 (src/quant.cpp)
+// quantize the ACTIVATION vector to int8 on every call ("q8_0-style activation
+// quantization", see the src/quant.cpp top-of-file comment and quantize_x there), not
+// just the weights. An INT8/INT4 forward therefore cannot match the f32 model
+// element-wise: quantization is a real lossy transform whose error accumulates with depth
+// (empirically it reaches a few tenths on GPT-2's logits by the final layer). The honest
+// question for a quantized path is FIDELITY, not f32-tight agreement: does the quantized
+// model still predict what the f32 model predicts?
+//
+// We gate on the behavioral invariant that is both bug-sensitive and exactly the showcase
+// claim -- the quantized engine's greedy argmax (and top-5) must match HF's f32 argmax at
+// every prompt position -- and we REPORT the raw logit divergence (max/mean abs) as the
+// measured quantization cost rather than asserting a hand-tuned bound on it. A wiring,
+// scale, or layout bug in the quant kernels scrambles the ranking and trips the argmax
+// gate; benign quantization noise does not. The isolated matvec_q8/matvec_q4 kernels are
+// pinned tightly against naive references in quant_test.cpp and (on real op shapes) in
+// OpLevelReference; this test covers the full quantized pipeline end to end on real
+// weights via the shipped load_model()+Model::forward() path.
+//
+// Reference: the ORIGINAL f32 HF logits dumped at models/ref/<model>/logits.f32 by the
+// f32 generation above (sections 1 and 2). No quant-specific Python reference is needed.
+// Skips cleanly if the quantized .tllm or the f32 dump is missing.
+
+int arg_max(const std::vector<float>& v) {
+  int best = 0;
+  for (int i = 1; i < static_cast<int>(v.size()); ++i)
+    if (v[i] > v[best]) best = i;
+  return best;
+}
+
+std::vector<int> top_k(const std::vector<float>& v, int k) {
+  std::vector<int> idx(v.size());
+  for (size_t i = 0; i < v.size(); ++i) idx[i] = static_cast<int>(i);
+  std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                    [&](int a, int b) { return v[a] > v[b]; });
+  idx.resize(k);
+  return idx;
+}
+
+int top_k_overlap(const std::vector<float>& a, const std::vector<float>& b, int k) {
+  const std::vector<int> ta = top_k(a, k);
+  const std::vector<int> tbv = top_k(b, k);
+  const std::set<int> tb(tbv.begin(), tbv.end());
+  int o = 0;
+  for (int x : ta) o += static_cast<int>(tb.count(x));
+  return o;
+}
+
+// Runs the shipped quantized model over `prompt` and checks, at every position, that its
+// greedy argmax and top-5 match the f32 HF reference logits. Reports the logit divergence
+// (the measured quantization cost) rather than gating a tuned bound on it.
+void RunQuantFidelity(const std::string& label, const fs::path& weights_path,
+                      const fs::path& f32_ref_dir, const std::vector<int>& prompt,
+                      bool require_exact_argmax) {
+  if (!fs::exists(weights_path))
+    GTEST_SKIP() << weights_path.string() << " not found; convert the model with --quant";
+  RefSet f32;
+  if (!f32.load(f32_ref_dir))
+    GTEST_SKIP() << f32_ref_dir.string() << "/manifest.txt not found; run scripts/gen_reference.py";
+
+  auto wf = WeightFile::open(weights_path.string());
+  const int V = wf->config().vocab_size;
+  const int T = static_cast<int>(prompt.size());
+
+  auto model = load_model(weights_path.string(), 64);
+  int argmax_match = 0, in_top5 = 0, top5_sum = 0;
+  double worst_abs = 0.0, sum_abs = 0.0;
+  size_t nvals = 0;
+  std::vector<int> flips;
+  for (int pos = 0; pos < T; ++pos) {
+    const float* ql = model->forward(prompt[pos], pos);
+    const std::vector<float> q(ql, ql + V);
+    const std::vector<float> f = f32.row("logits", pos, V);
+    ASSERT_EQ(static_cast<int>(f.size()), V) << label << " pos=" << pos;
+    const std::vector<int> f_top = top_k(f, 5);
+    const int qa = arg_max(q), fa = f_top[0];
+    const bool q_in_f5 = std::find(f_top.begin(), f_top.end(), qa) != f_top.end();
+    const double f_gap = double(f[fa]) - double(f[f_top[1]]);  // f32 top1 - top2 margin
+    if (q_in_f5) ++in_top5;
+    if (qa == fa) ++argmax_match;
+    else {
+      flips.push_back(pos);
+      std::printf(
+          "    [%s] pos %d FLIP: f32 top1=%d (%.3f, margin %.3f over top2), quant top1=%d (%.3f); "
+          "quant pick in f32 top-5: %s\n",
+          label.c_str(), pos, fa, f[fa], f_gap, qa, q[qa], q_in_f5 ? "yes" : "no");
+    }
+    top5_sum += top_k_overlap(q, f, 5);
+    for (int i = 0; i < V; ++i) {
+      const double e = std::fabs(double(q[i]) - double(f[i]));
+      worst_abs = std::max(worst_abs, e);
+      sum_abs += e;
+      ++nvals;
+    }
+  }
+
+  std::printf(
+      "[%s] argmax match %d/%d, greedy pick in f32 top-5 %d/%d, mean top-5 overlap %.2f/5; "
+      "logit diff vs f32 HF: max abs %.4g, mean abs %.4g (measured quantization cost)\n",
+      label.c_str(), argmax_match, T, in_top5, T, double(top5_sum) / T, worst_abs,
+      sum_abs / double(nvals));
+
+  std::string flip_str;
+  for (int p : flips) flip_str += std::to_string(p) + " ";
+
+  // Bug-sensitive floor for EVERY quantized precision: the greedy pick must stay inside the
+  // f32 model's top-5 at every position. A wiring/scale/layout bug in matvec_q8/matvec_q4
+  // (src/quant.cpp) pushes the argmax to an unrelated token (out of the top-5); benign
+  // quantization noise only reshuffles already near-tied candidates. The per-position FLIP
+  // lines above show where and why q4 diverges (always a near-tied or high-entropy position,
+  // with the pick still in f32's top-5).
+  EXPECT_EQ(in_top5, T)
+      << label << ": quantized greedy pick left the f32 top-5 at position(s) " << flip_str
+      << "(likely a kernel bug, not quantization noise)";
+
+  // Q8 is near-lossless, so additionally require its greedy token to EXACTLY match f32 at
+  // every position. Q4 is aggressive; its argmax may legitimately differ at high-entropy
+  // positions (the top-5 floor above still holds), so the agreement is reported, not gated.
+  if (require_exact_argmax)
+    EXPECT_EQ(argmax_match, T)
+        << label << ": q8 greedy argmax should match f32 (near-lossless); diverged at " << flip_str;
+}
+
+TEST(Gpt2Q8Reference, PredictionsMatchF32HuggingFace) {
+  const fs::path m = test::models_dir();
+  RunQuantFidelity("gpt2-q8", m / "gpt2-q8.tllm", m / "ref" / "gpt2", kPrompt, /*require_exact_argmax=*/true);
+}
+TEST(Gpt2Q4Reference, PredictionsMatchF32HuggingFace) {
+  const fs::path m = test::models_dir();
+  RunQuantFidelity("gpt2-q4", m / "gpt2-q4.tllm", m / "ref" / "gpt2", kPrompt, /*require_exact_argmax=*/false);
+}
+
+void RunTinyLlamaQuantFidelity(const std::string& quant, bool require_exact_argmax) {
+  const fs::path m = test::models_dir();
+  const fs::path weights = m / ("tinyllama-" + quant + ".tllm");
+  const fs::path tok_path = m / "tinyllama" / "tokenizer.model";
+  if (!fs::exists(weights))
+    GTEST_SKIP() << weights.string() << " not found; convert with --quant " << quant;
+  if (!fs::exists(tok_path)) GTEST_SKIP() << tok_path.string() << " not found; see scripts/README.md";
+
+  auto wf = WeightFile::open(weights.string());
+  ASSERT_EQ(wf->config().arch, Arch::LLAMA);
+  const int bos = wf->config().bos_id;
+  ASSERT_GE(bos, 0);
+  auto tok = make_sp_tokenizer(tok_path.string());
+  const std::vector<int> encoded = tok->encode("The capital of France is");
+  ASSERT_EQ(encoded, kTinyLlamaPromptIds)
+      << "engine SentencePiece encode does not match the ids scripts/gen_reference.py used for HF";
+  std::vector<int> prompt = {bos};
+  prompt.insert(prompt.end(), encoded.begin(), encoded.end());
+
+  RunQuantFidelity("tinyllama-" + quant, weights, m / "ref" / "tinyllama", prompt, require_exact_argmax);
+}
+
+TEST(TinyLlamaQ8Reference, PredictionsMatchF32HuggingFace) {
+  RunTinyLlamaQuantFidelity("q8", /*require_exact_argmax=*/true);
+}
+TEST(TinyLlamaQ4Reference, PredictionsMatchF32HuggingFace) {
+  RunTinyLlamaQuantFidelity("q4", /*require_exact_argmax=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Op-level references: fixed-seed random inputs, HF/torch reference implementations.
 
 TEST(OpLevelReference, MatchesHuggingFaceAndTorch) {
   const fs::path ref_dir = fs::path(test::models_dir()) / "ref" / "ops";

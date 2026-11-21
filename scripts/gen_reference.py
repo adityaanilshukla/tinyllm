@@ -24,59 +24,18 @@ Output layout (gitignored: lives under models/, and models/ is already gitignore
     models/ref/ops/manifest.txt
     models/ref/ops/<name>.f32
 
-Three independent things are dumped:
+Four independent things are dumped:
 
-1. gen_gpt2_reference(): runs real openai-community/gpt2 weights (models/gpt2, the same
-   HF dir tinyllm-convert reads) through HF's GPT2Model on a fixed 5-token prompt and
-   captures the post-op intermediate at every point tinyllm's forward pass also computes
-   one: token+pos embedding, each block's ln_1/qkv/merged-attention-output/post-attention
-   residual/ln_2/mlp-fc/mlp-gelu/post-mlp residual, the final ln_f, and the logits. This
-   is captured via forward hooks on the real submodules (GPT2Block.ln_1, GPT2Attention.
-   c_attn, GPT2Attention.c_proj (pre-hook for its input = merged heads, post-hook for its
-   output = pre-residual attention contribution), GPT2MLP.c_fc, GPT2MLP.act, GPT2MLP.
-   c_proj), run with attn_implementation="eager" so there is a plain softmax(QK^T/sqrt(d))V
-   under the hood rather than a fused SDPA kernel.
+1. gen_gpt2_reference() / gen_tinyllama_reference(): runs real HF weights (models/gpt2,
+   models/tinyllama -- the same HF dirs tinyllm-convert reads) through HF's GPT2Model /
+   LlamaForCausalLM on a fixed prompt and captures the post-op intermediate at every point
+   tinyllm's forward pass also computes one. See _capture_and_dump_gpt2 /
+   _capture_and_dump_tinyllama below for the exact list; it is unchanged from the original
+   version of this script. This is the existing f32 reference; nothing about it changed.
 
-   Fixed prompt: "The capital of France is" -> token ids [464, 3139, 286, 4881, 318],
-   the same prompt tests/gpt2_e2e_test.cpp pins tokens against. Running the whole 5-token
-   sequence through HF in one batched causal forward is mathematically identical, position
-   by position, to tinyllm's one-token-at-a-time KV-cache forward: causal attention only
-   lets position p see positions <= p either way.
-
-2. gen_tinyllama_reference(): runs real TinyLlama-1.1B-Chat-v1.0 weights (models/tinyllama,
-   the same HF dir tinyllm-convert reads) through HF's LlamaForCausalLM on a fixed 6-token
-   id sequence (BOS + 5-token prompt, see TINYLLAMA_FULL_IDS below) and captures the
-   post-op intermediate at every point the hand-rolled C++ reproduction in
-   TinyLlamaReference.ElementWiseMatchesHuggingFace also computes one: the embedding, each
-   layer's input_layernorm/q_proj/k_proj/v_proj (all PRE-RoPE)/merged-GQA-attention-output
-   (POST-RoPE, so RoPE+attention are exercised together there, not isolated)/post-attention
-   residual/post_attention_layernorm/gate_proj/up_proj/SwiGLU-gate/down_proj/post-mlp
-   residual, the final norm, and the logits. Captured via forward hooks on the real
-   submodules, run with attn_implementation="eager".
-
-   Fixed prompt: "The capital of France is" -> SentencePiece ids [450, 7483, 310, 3444,
-   338] with BOS (id 1) prepended -> TINYLLAMA_FULL_IDS = [1, 450, 7483, 310, 3444, 338].
-   tinyllm's Tokenizer::encode() never adds BOS (the CLI prepends it for LLaMA); see the
-   module comment above TINYLLAMA_PROMPT_IDS for how this id list is cross-checked against
-   the engine's actual SentencePiece output. As with GPT-2 above, one batched causal
-   forward over the full 6-token sequence is mathematically identical, position by
-   position, to tinyllm's one-token-at-a-time KV-cache forward.
-
-3. gen_op_level_reference(): fixed-seed random inputs run through HF/torch's *own*
-   reference implementations of each named op, independent of the GPT-2 forward above:
-     - LayerNorm:    torch.nn.functional.layer_norm
-     - GELU:         transformers.activations.NewGELUActivation (GPT-2's "gelu_new")
-     - Softmax:      torch.nn.functional.softmax
-     - Attention:    manual torch matmul/softmax/matmul, single query attending over a
-                      causal KV cache of n_pos positions (MHA and GQA cases), mirroring
-                      tinyllm's attention() contract (one query position, n_pos keys).
-     - RMSNorm:      transformers.models.llama.modeling_llama.LlamaRMSNorm
-     - RoPE:         transformers.models.llama.modeling_llama.apply_rotary_pos_emb +
-                      the library's own default inv_freq formula, HF rotate_half pairing.
-     - SwiGLU gate:  torch.nn.functional.silu(gate) * up
-
-   All seeds are fixed (torch.manual_seed per tensor, listed inline) so this script is
-   fully reproducible.
+2. gen_op_level_reference(): fixed-seed random inputs run through HF/torch's *own*
+   reference implementations of each named op, independent of the GPT-2 forward above.
+   Unchanged from the original version of this script; see the function for the full list.
 """
 import math
 import struct
@@ -123,17 +82,14 @@ class Dumper:
         print(f"wrote {len(self.entries)} tensors -> {path}")
 
 
+# --------------------------------------------------------------------------- .tllm reader
 # --------------------------------------------------------------------------- GPT-2 (real weights)
 
 PROMPT_IDS = [464, 3139, 286, 4881, 318]  # "The capital of France is"
 
 
-def gen_gpt2_reference():
+def _load_gpt2_model():
     from transformers import GPT2LMHeadModel, GPT2Tokenizer
-
-    if not (GPT2_DIR / "model.safetensors").exists():
-        print(f"skip: {GPT2_DIR} has no model.safetensors", file=sys.stderr)
-        return
 
     tok = GPT2Tokenizer.from_pretrained(str(GPT2_DIR))
     ids = tok.encode("The capital of France is")
@@ -141,6 +97,10 @@ def gen_gpt2_reference():
 
     model = GPT2LMHeadModel.from_pretrained(str(GPT2_DIR), attn_implementation="eager")
     model.eval().to(torch.float32)
+    return model
+
+
+def _capture_and_dump_gpt2(model, out_dir: Path, header: str):
     transformer = model.transformer
     n_layers = len(transformer.h)
     d = model.config.n_embd
@@ -161,19 +121,21 @@ def gen_gpt2_reference():
 
     handles = []
     for i, block in enumerate(transformer.h):
-        handles.append(block.ln_1.register_forward_hook(save(f"l{i}.ln1")))
-        handles.append(block.attn.c_attn.register_forward_hook(save(f"l{i}.qkv")))
-        handles.append(block.attn.c_proj.register_forward_pre_hook(save_input(f"l{i}.attn_merged")))
-        handles.append(block.attn.c_proj.register_forward_hook(save(f"l{i}.attn_proj")))
-        handles.append(block.ln_2.register_forward_hook(save(f"l{i}.ln2")))
-        handles.append(block.mlp.c_fc.register_forward_hook(save(f"l{i}.mlp_fc")))
-        handles.append(block.mlp.act.register_forward_hook(save(f"l{i}.mlp_gelu")))
-        handles.append(block.mlp.c_proj.register_forward_hook(save(f"l{i}.mlp_proj")))
+        p = f"l{i}."
+        handles.append(block.ln_1.register_forward_hook(save(p + "ln1")))
+        handles.append(block.attn.c_attn.register_forward_hook(save(p + "qkv")))
+        # c_proj's pre-hook captures its input: the merged attention output, pre-projection.
+        handles.append(block.attn.c_proj.register_forward_pre_hook(save_input(p + "attn_merged")))
+        handles.append(block.attn.c_proj.register_forward_hook(save(p + "attn_proj")))
+        handles.append(block.ln_2.register_forward_hook(save(p + "ln2")))
+        handles.append(block.mlp.c_fc.register_forward_hook(save(p + "mlp_fc")))
+        handles.append(block.mlp.act.register_forward_hook(save(p + "mlp_gelu")))
+        handles.append(block.mlp.c_proj.register_forward_hook(save(p + "mlp_proj")))
         # Raw block output (pre-ln_f), independent of however output_hidden_states
         # chooses to represent the last layer (see note below): block.forward returns
         # (hidden_states, ...); ln_f is applied by GPT2Model only *after* this loop, so
         # this hook is always the un-normed residual stream, including for the last block.
-        handles.append(block.register_forward_hook(save(f"l{i}.block_out")))
+        handles.append(block.register_forward_hook(save(p + "block_out")))
 
     input_ids = torch.tensor([PROMPT_IDS], dtype=torch.long)
     out = model(input_ids, output_hidden_states=True)
@@ -187,7 +149,7 @@ def gen_gpt2_reference():
     for h in handles:
         h.remove()
 
-    d_out = Dumper(REF_DIR / "gpt2")
+    d_out = Dumper(out_dir)
     T = len(PROMPT_IDS)
     position_ids = torch.arange(T).unsqueeze(0)
     embed = transformer.wte(input_ids) + transformer.wpe(position_ids)  # transformer.drop is identity in eval()
@@ -219,8 +181,16 @@ def gen_gpt2_reference():
     d_out.add("logits", logits)
     d_out.write_manifest(
         f"GPT-2 small, HF weights at {GPT2_DIR}, prompt tokens {PROMPT_IDS}, "
-        f"attn_implementation=eager, float32, T={T} d={d} n_layers={n_layers}"
+        f"attn_implementation=eager, float32, T={T} d={d} n_layers={n_layers}. {header}"
     )
+
+
+def gen_gpt2_reference():
+    if not (GPT2_DIR / "model.safetensors").exists():
+        print(f"skip: {GPT2_DIR} has no model.safetensors", file=sys.stderr)
+        return
+    model = _load_gpt2_model()
+    _capture_and_dump_gpt2(model, REF_DIR / "gpt2", "f32 reference.")
 
 
 # --------------------------------------------------------------------------- TinyLlama (real weights)
@@ -238,12 +208,8 @@ TINYLLAMA_PROMPT_IDS = [450, 7483, 310, 3444, 338]
 TINYLLAMA_FULL_IDS = [TINYLLAMA_BOS_ID] + TINYLLAMA_PROMPT_IDS  # what both HF and the engine run
 
 
-def gen_tinyllama_reference():
+def _load_tinyllama_model():
     from transformers import AutoTokenizer, LlamaForCausalLM
-
-    if not (TINYLLAMA_DIR / "model.safetensors").exists():
-        print(f"skip: {TINYLLAMA_DIR} has no model.safetensors", file=sys.stderr)
-        return
 
     # Secondary cross-check only (see module-level comment on TINYLLAMA_PROMPT_IDS above).
     # This venv has no `sentencepiece` pip package, so AutoTokenizer falls back to the
@@ -260,6 +226,10 @@ def gen_tinyllama_reference():
 
     model = LlamaForCausalLM.from_pretrained(str(TINYLLAMA_DIR), attn_implementation="eager")
     model.eval().to(torch.float32)
+    return model
+
+
+def _capture_and_dump_tinyllama(model, out_dir: Path, header: str):
     lm = model.model  # LlamaModel
     n_layers = len(lm.layers)
     d = model.config.hidden_size
@@ -289,12 +259,10 @@ def gen_tinyllama_reference():
         handles.append(layer.self_attn.q_proj.register_forward_hook(save(p + "q")))
         handles.append(layer.self_attn.k_proj.register_forward_hook(save(p + "k")))
         handles.append(layer.self_attn.v_proj.register_forward_hook(save(p + "v")))
-        # Pre-hook on o_proj captures its input = RoPE'd GQA attention output, heads
-        # merged back to [T, n_heads*head_dim], before the output projection. This is
-        # the one point where RoPE and GQA attention are exercised but not isolated;
-        # both are already checked standalone (with synthetic data) by OpLevelReference,
-        # so this hook's job is to catch the *wiring* of rope()+attention() together, not
-        # to re-derive either op from scratch.
+        # Pre-hook on o_proj captures its input = RoPE'd GQA attention output, heads merged
+        # back to [T, n_heads*head_dim], before the output projection. The one point where
+        # RoPE and GQA attention are exercised together (not isolated); both are also checked
+        # standalone with synthetic data by OpLevelReference, so this catches their wiring.
         handles.append(layer.self_attn.o_proj.register_forward_pre_hook(save_input(p + "attn_merged")))
         handles.append(layer.self_attn.o_proj.register_forward_hook(save(p + "attn_proj")))
         handles.append(layer.post_attention_layernorm.register_forward_hook(save(p + "ln2")))
@@ -313,7 +281,7 @@ def gen_tinyllama_reference():
     for h in handles:
         h.remove()
 
-    d_out = Dumper(REF_DIR / "tinyllama")
+    d_out = Dumper(out_dir)
     T = len(TINYLLAMA_FULL_IDS)
     embed = lm.embed_tokens(input_ids)[0]  # [T, d], no positional embedding table for LLaMA
     d_out.add("embed", embed)
@@ -357,8 +325,16 @@ def gen_tinyllama_reference():
         f"n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} d_ff={d_ff}. "
         f"q/k are PRE-RoPE (raw q_proj/k_proj output); attn_merged is POST-RoPE+GQA-attention, "
         f"pre-o_proj, so RoPE and attention are exercised together there, not isolated (see "
-        f"OpLevelReference / ops_test.cpp for isolated RoPE and attention checks)."
+        f"OpLevelReference / ops_test.cpp for isolated RoPE and attention checks). {header}"
     )
+
+
+def gen_tinyllama_reference():
+    if not (TINYLLAMA_DIR / "model.safetensors").exists():
+        print(f"skip: {TINYLLAMA_DIR} has no model.safetensors", file=sys.stderr)
+        return
+    model = _load_tinyllama_model()
+    _capture_and_dump_tinyllama(model, REF_DIR / "tinyllama", "f32 reference.")
 
 
 # --------------------------------------------------------------------------- op-level references

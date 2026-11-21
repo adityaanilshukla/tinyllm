@@ -24,6 +24,11 @@ hf download TinyLlama/TinyLlama-1.1B-Chat-v1.0 --local-dir models/tinyllama
 cmake -S . -B build -G Ninja && cmake --build build
 ./build/tinyllm-convert models/gpt2 models/gpt2.tllm
 ./build/tinyllm-convert models/tinyllama models/tinyllama-f32.tllm   # no --quant: f32, for element-wise comparison
+# Quantized weights, for the Q8/Q4 fidelity tests (argmax vs the f32 HF dumps):
+./build/tinyllm-convert models/gpt2 models/gpt2-q8.tllm --quant q8
+./build/tinyllm-convert models/gpt2 models/gpt2-q4.tllm --quant q4
+./build/tinyllm-convert models/tinyllama models/tinyllama-q8.tllm --quant q8
+./build/tinyllm-convert models/tinyllama models/tinyllama-q4.tllm --quant q4
 ```
 
 `gen_reference.py` exercises both GPT-2's and TinyLlama's real weights end-to-end now
@@ -75,15 +80,22 @@ order of ~5GB; 26GB was free when this was last run, no problem).
 ## Run the tests
 
 ```sh
-ctest --test-dir build -R "Gpt2Reference|TinyLlamaReference|OpLevelReference" --output-on-failure
-# or, to see the worst-case-error summary printed even on success:
-./build/tests/tinyllm-tests --gtest_filter="Gpt2Reference.*:TinyLlamaReference.*:OpLevelReference.*"
+ctest --test-dir build -R "Reference" --output-on-failure
+# or, to see the worst-case-error / quantization-cost summaries printed even on success:
+./build/tests/tinyllm-tests --gtest_filter="*Reference*"
 ```
 
-All three tests `GTEST_SKIP` cleanly if their weight file(s) (`models/gpt2.tllm` /
-`models/tinyllama-f32.tllm` / `models/tinyllama/tokenizer.model`) or the matching
-`models/ref/*` dumps are missing. `TinyLlamaReference.ElementWiseMatchesHuggingFace`
-also runs the actual shipped `load_model()` + `Model::forward()` path
-(`src/llama.cpp`) against the same HF logits, in addition to the hand-rolled
-reproduction through the public ops -- this is what closes the "TinyLlama's real
-weights are not yet run end-to-end against HF" gap noted in `CLAUDE.md`.
+All tests `GTEST_SKIP` cleanly if their weight file(s) (`models/*.tllm` /
+`models/tinyllama/tokenizer.model`) or the matching `models/ref/*` dumps are missing.
+`TinyLlamaReference.ElementWiseMatchesHuggingFace` also runs the actual shipped
+`load_model()` + `Model::forward()` path (`src/llama.cpp`) against the same HF logits, in
+addition to the hand-rolled reproduction through the public ops -- this is what closes the
+"TinyLlama's real weights are not yet run end-to-end against HF" gap noted in `CLAUDE.md`.
+
+The quantized tests (`Gpt2Q8Reference`, `Gpt2Q4Reference`, `TinyLlamaQ8Reference`,
+`TinyLlamaQ4Reference`) run the shipped quantized `.tllm` through `Model::forward()` and
+check *fidelity* against the same f32 HF logit dumps: a W8A8/W4A8 forward cannot match
+f32 element-wise (it quantizes activations too), so they gate on the behavioral invariant
+that the greedy argmax (Q8 exactly, every precision within the f32 top-5) is preserved,
+and report the raw logit divergence as the measured quantization cost. See the comment
+above `RunQuantFidelity` in the test for the rationale.
