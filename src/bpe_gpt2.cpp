@@ -1,6 +1,7 @@
 // GPT-2 byte-level BPE tokenizer (vocab.json + merges.txt).
 #include <algorithm>
 #include <climits>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>

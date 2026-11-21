@@ -27,3 +27,11 @@ set_target_properties(tinyllm_cuda PROPERTIES
 
 add_executable(tinyllm-bench-cuda ${CMAKE_SOURCE_DIR}/bench/bench_cuda.cpp)
 target_link_libraries(tinyllm-bench-cuda PRIVATE tinyllm_cuda tinyllm CUDA::cublas CUDA::cudart)
+
+# Correctness regression test: each kernel vs. the CPU ops in include/tinyllm/ops.h.
+# Plain executable (no GoogleTest dependency) that exits nonzero on failure.
+add_executable(tinyllm-correctness-cuda ${CMAKE_CURRENT_SOURCE_DIR}/correctness_test.cpp)
+target_link_libraries(tinyllm-correctness-cuda PRIVATE tinyllm_cuda tinyllm CUDA::cudart)
+
+enable_testing()
+add_test(NAME tinyllm-correctness-cuda COMMAND tinyllm-correctness-cuda)

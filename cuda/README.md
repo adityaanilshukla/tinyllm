@@ -14,7 +14,13 @@ cmake -S . -B build-cuda -G Ninja -DTINYLLM_CUDA=ON && cmake --build build-cuda 
 ```
 
 By default the kernels are compiled for the GPU in the build machine (`native`).
-Override with e.g. `-DCMAKE_CUDA_ARCHITECTURES="86;120"`. These kernels have not
-been compiled yet, so expect fixes on the first build.
+Override with e.g. `-DCMAKE_CUDA_ARCHITECTURES="86;120"`. Verified to build and run
+on an RTX 5060 Ti (sm_120) with CUDA 13.5 and GCC 16, no source changes needed.
 The benchmark compares each kernel with the CPU ops in `ops.h` and, for matmul, with
-`cublasSgemm`, printing time, throughput and max absolute error.
+`cublasSgemm`, printing time, throughput and max absolute error. `correctness_test.cpp`
+(registered as the `tinyllm-correctness-cuda` ctest) checks every kernel against the CPU
+ops within fixed tolerances and fails nonzero on regression:
+
+```
+ctest --test-dir build-cuda --output-on-failure
+```
