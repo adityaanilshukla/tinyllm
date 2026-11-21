@@ -53,8 +53,8 @@ type is Release with `-O3 -march=native`, so the binaries are tuned for the
 machine that built them.
 
 On Linux, install SentencePiece and pkg-config from your package manager. The
-CMake file asks pkg-config for both `sentencepiece` and `absl_status`, because
-Homebrew's `sentencepiece.pc` doesn't list abseil.
+CMake file asks pkg-config for `sentencepiece`, and also links `absl_status` when
+pkg-config finds it, because Homebrew's `sentencepiece.pc` doesn't list abseil.
 
 ## Get a model
 

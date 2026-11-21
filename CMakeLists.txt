@@ -13,13 +13,18 @@ option(TINYLLM_CUDA "Build CUDA kernels (needs nvcc)" OFF)
 option(TINYLLM_BUILD_TESTS "Build the GoogleTest suite in tests/" ON)
 
 find_package(PkgConfig REQUIRED)
-# Homebrew sentencepiece needs abseil, which its .pc file does not list.
-pkg_check_modules(SENTENCEPIECE REQUIRED IMPORTED_TARGET sentencepiece absl_status)
+pkg_check_modules(SENTENCEPIECE REQUIRED IMPORTED_TARGET sentencepiece)
+# Homebrew sentencepiece needs abseil, which its .pc file does not list. Distro
+# packages (e.g. Ubuntu's libsentencepiece-dev) may not ship absl_status.pc at all.
+pkg_check_modules(ABSL_STATUS IMPORTED_TARGET absl_status)
 
 file(GLOB TINYLLM_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
 add_library(tinyllm STATIC ${TINYLLM_SRC})
 target_include_directories(tinyllm PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(tinyllm PUBLIC PkgConfig::SENTENCEPIECE)
+if(ABSL_STATUS_FOUND)
+  target_link_libraries(tinyllm PUBLIC PkgConfig::ABSL_STATUS)
+endif()
 
 add_executable(tinyllm-cli tools/cli.cpp)
 target_link_libraries(tinyllm-cli PRIVATE tinyllm)

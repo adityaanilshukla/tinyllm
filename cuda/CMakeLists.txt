@@ -1,9 +1,9 @@
 # CUDA kernels + benchmark. Enabled from the top level with -DTINYLLM_CUDA=ON.
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
 
 # Must be decided before enable_language(CUDA), which otherwise picks the nvcc default.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-  set(CMAKE_CUDA_ARCHITECTURES "70;80;86;89;90")
+  set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
 enable_language(CUDA)

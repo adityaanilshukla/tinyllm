@@ -48,7 +48,7 @@ The contracts live in `include/tinyllm/`; read them before changing anything.
 - **Tokenizers** (`tokenizer.h`):
   - GPT-2 byte-level BPE is hand-written (`src/bpe_gpt2.cpp`). LLaMA wraps SentencePiece (`src/sp_tokenizer.cpp`).
   - `encode` never adds BOS; the CLI prepends it for LLaMA.
-- **CMake:** it globs `src/*.cpp` into the `tinyllm` library, so new source files need no CMake edit. Homebrew's `sentencepiece.pc` doesn't list abseil, so `absl_status` is linked explicitly.
+- **CMake:** it globs `src/*.cpp` into the `tinyllm` library, so new source files need no CMake edit. Homebrew's `sentencepiece.pc` doesn't list abseil, so `absl_status` is linked explicitly when pkg-config finds it (distro packages may lack it). CUDA targets default to `native` (the build machine's GPU).
 
 ## Status
 

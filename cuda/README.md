@@ -7,12 +7,14 @@ Hand-written fp32 kernels (`ops_cuda.h`, namespace `tinyllm::cuda`, device point
 - `layernorm.cu`: fused layer norm, one block per row.
 - `softmax.cu`: stable row softmax, one block per row.
 
-Build and benchmark (needs nvcc / CUDA 12 and cuBLAS):
+Build and benchmark (needs nvcc, cuBLAS, CMake 3.24+, and the SentencePiece dev package for the CPU side; Blackwell cards such as the RTX 50 series need CUDA 12.8+):
 
 ```
 cmake -S . -B build-cuda -G Ninja -DTINYLLM_CUDA=ON && cmake --build build-cuda && ./build-cuda/cuda/tinyllm-bench-cuda
 ```
 
-Override the GPU targets with `-DCMAKE_CUDA_ARCHITECTURES=86` (default `70;80;86;89;90`).
+By default the kernels are compiled for the GPU in the build machine (`native`).
+Override with e.g. `-DCMAKE_CUDA_ARCHITECTURES="86;120"`. These kernels have not
+been compiled yet, so expect fixes on the first build.
 The benchmark compares each kernel with the CPU ops in `ops.h` and, for matmul, with
 `cublasSgemm`, printing time, throughput and max absolute error.
