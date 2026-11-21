@@ -32,6 +32,9 @@ target_link_libraries(tinyllm-cli PRIVATE tinyllm)
 add_executable(tinyllm-convert tools/convert.cpp)
 target_link_libraries(tinyllm-convert PRIVATE tinyllm)
 
+add_executable(tinyllm-bench-cpu bench/bench_cpu.cpp)
+target_link_libraries(tinyllm-bench-cpu PRIVATE tinyllm)
+
 if(TINYLLM_CUDA)
   add_subdirectory(cuda)
 endif()
