@@ -1,6 +1,6 @@
 // Element-wise verification against real PyTorch/HuggingFace reference dumps, generated
-// by scripts/gen_reference.py (see scripts/README.md for exact commands). Two independent
-// things are checked:
+// by scripts/gen_reference.py (see scripts/README.md for exact commands). Three
+// independent things are checked:
 //
 //   1. Gpt2Reference.ElementWiseMatchesHuggingFace: reproduces the GPT-2 small forward
 //      pass for a fixed 5-token prompt using ONLY the public ops in tinyllm/ops.h and
@@ -11,22 +11,36 @@
 //      residual, the final ln_f, and the logits -- is compared element-wise against HF's
 //      real GPT-2 weights run through transformers (attn_implementation="eager").
 //
-//   2. OpLevelReference.MatchesHuggingFaceAndTorch: fixed-seed random inputs run through
+//   2. TinyLlamaReference.ElementWiseMatchesHuggingFace: the same kind of independent
+//      reproduction, through the public ops (rmsnorm, linear, rope, attention, silu_mul),
+//      of TinyLlama-1.1B's forward pass for a fixed 6-token id sequence (BOS + 5-token
+//      prompt), plus a check of the actual shipped load_model()+Model::forward() path
+//      (src/llama.cpp) against the same HF logits. This is the one that closes the gap
+//      noted in CLAUDE.md: TinyLlama's real weights were previously only spot-checked by
+//      eye, never run end-to-end against HF. q_proj/k_proj outputs are captured PRE-RoPE;
+//      the merged GQA attention output is POST-RoPE, so RoPE and attention are exercised
+//      together there, not in isolation (see (3) below for isolated RoPE/attention checks
+//      against TinyLlama's own dimensions, just not its real weights).
+//
+//   3. OpLevelReference.MatchesHuggingFaceAndTorch: fixed-seed random inputs run through
 //      tinyllm's layernorm, gelu, softmax, attention (MHA and GQA), rmsnorm, rope, and
 //      silu_mul, compared against torch/transformers's own reference implementations of
 //      each (torch.nn.functional.layer_norm/softmax/silu, transformers' NewGELUActivation,
 //      LlamaRMSNorm, and apply_rotary_pos_emb). This does not need any model weights,
 //      only the reference dump under models/ref/ops.
 //
-// Both halves skip cleanly (GTEST_SKIP) when their reference dumps are absent, following
-// the TINYLLM_MODELS_DIR skip pattern used elsewhere in this suite (see gpt2_e2e_test.cpp).
-// Neither dump is checked into the repo (models/ is gitignored); regenerate with:
+// All three skip cleanly (GTEST_SKIP) when their reference dumps or weight files are
+// absent, following the TINYLLM_MODELS_DIR skip pattern used elsewhere in this suite (see
+// gpt2_e2e_test.cpp). None of these dumps are checked into the repo (models/ is
+// gitignored); regenerate with:
 //
 //   uv venv --python 3.12 models/.venv-ref
 //   uv pip install --python models/.venv-ref torch --extra-index-url https://download.pytorch.org/whl/cpu
 //   uv pip install --python models/.venv-ref transformers numpy safetensors huggingface_hub
 //   hf download openai-community/gpt2 --local-dir models/gpt2
+//   hf download TinyLlama/TinyLlama-1.1B-Chat-v1.0 --local-dir models/tinyllama
 //   ./build/tinyllm-convert models/gpt2 models/gpt2.tllm
+//   ./build/tinyllm-convert models/tinyllama models/tinyllama-f32.tllm
 //   models/.venv-ref/bin/python scripts/gen_reference.py
 #include <gtest/gtest.h>
 
@@ -45,6 +59,7 @@
 #include "tinyllm/format.h"
 #include "tinyllm/model.h"
 #include "tinyllm/ops.h"
+#include "tinyllm/tokenizer.h"
 
 namespace tinyllm {
 namespace {
@@ -279,7 +294,202 @@ TEST(Gpt2Reference, ElementWiseMatchesHuggingFace) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Op-level references: fixed-seed random inputs, HF/torch reference implementations.
+// 2. TinyLlama end-to-end, element-wise against real HF weights.
+
+// "The capital of France is", SentencePiece ids with no BOS. This is the one place in
+// the suite where the prompt's token ids are *verified*, not just asserted: the test
+// below calls the engine's real SentencePiece encode() on the literal string and
+// ASSERT_EQs the result against this list before trusting anything else, since
+// scripts/gen_reference.py's HF-side tokenization (see its own cross-check comment) runs
+// through a different code path (no `sentencepiece` pip package in that venv, so
+// AutoTokenizer falls back to the fast tokenizers-crate backend built from
+// tokenizer.json) and the two must agree on the exact ids for the comparison below to be
+// meaningful.
+const std::vector<int> kTinyLlamaPromptIds = {450, 7483, 310, 3444, 338};
+
+TEST(TinyLlamaReference, ElementWiseMatchesHuggingFace) {
+  const fs::path models = test::models_dir();
+  const fs::path weights_path = models / "tinyllama-f32.tllm";
+  const fs::path ref_dir = models / "ref" / "tinyllama";
+  const fs::path tok_path = models / "tinyllama" / "tokenizer.model";
+  if (!fs::exists(weights_path)) GTEST_SKIP() << "models/tinyllama-f32.tllm not found; see scripts/README.md";
+  if (!fs::exists(tok_path)) GTEST_SKIP() << "models/tinyllama/tokenizer.model not found; see scripts/README.md";
+  RefSet ref;
+  if (!ref.load(ref_dir))
+    GTEST_SKIP() << "models/ref/tinyllama/manifest.txt not found; run scripts/gen_reference.py";
+
+  // Tokenization cross-check (see kTinyLlamaPromptIds comment above): the engine's own
+  // SentencePiece encode() never adds BOS (tinyllm/tokenizer.h, CLAUDE.md); the CLI
+  // prepends it for LLaMA (tools/cli.cpp). Print both the bare encode and the full
+  // BOS-prefixed sequence so a mismatch is obvious from test output, not just a diff.
+  auto tok = make_sp_tokenizer(tok_path.string());
+  const std::vector<int> encoded = tok->encode("The capital of France is");
+  {
+    std::string s;
+    for (size_t i = 0; i < encoded.size(); ++i) s += (i ? ", " : "") + std::to_string(encoded[i]);
+    std::printf("tinyllama encode(\"The capital of France is\") = [%s]\n", s.c_str());
+  }
+  ASSERT_EQ(encoded, kTinyLlamaPromptIds)
+      << "engine SentencePiece encode does not match the ids scripts/gen_reference.py used for HF; "
+         "regenerate the refs or repin kTinyLlamaPromptIds/TINYLLAMA_PROMPT_IDS to the engine's output";
+
+  auto wf = WeightFile::open(weights_path.string());
+  const Config& c = wf->config();
+  ASSERT_EQ(c.arch, Arch::LLAMA);
+  ASSERT_EQ(c.d_model, 2048);
+  ASSERT_EQ(c.n_layers, 22);
+  ASSERT_EQ(c.n_heads, 32);
+  ASSERT_EQ(c.n_kv_heads, 4);
+  ASSERT_EQ(c.head_dim, 64);
+  ASSERT_GE(c.bos_id, 0) << "LLaMA config has no bos_id; cannot build the BOS-prefixed sequence";
+
+  std::vector<int> prompt = {c.bos_id};
+  prompt.insert(prompt.end(), encoded.begin(), encoded.end());
+  {
+    std::string s;
+    for (size_t i = 0; i < prompt.size(); ++i) s += (i ? ", " : "") + std::to_string(prompt[i]);
+    std::printf("tinyllama full id sequence (BOS + prompt) = [%s]\n", s.c_str());
+  }
+
+  const int d = c.d_model, n_heads = c.n_heads, n_kv_heads = c.n_kv_heads, head_dim = c.head_dim, d_ff = c.d_ff;
+  const int q_dim = n_heads * head_dim, kv_dim = n_kv_heads * head_dim;
+  const int T = static_cast<int>(prompt.size());
+
+  const Tensor& tok_emb = wf->get("tok_emb");
+  const float* norm_f_w = wf->get("norm_f.w").f32();
+  const Tensor& lm_head = wf->has("lm_head.w") ? wf->get("lm_head.w") : tok_emb;
+
+  struct Layer {
+    const float *attn_norm, *mlp_norm;
+    const Tensor *wq, *wk, *wv, *wo, *wgate, *wup, *wdown;
+  };
+  std::vector<Layer> layers(c.n_layers);
+  for (int i = 0; i < c.n_layers; ++i) {
+    const std::string p = "l" + std::to_string(i) + ".";
+    Layer& L = layers[i];
+    L.attn_norm = wf->get(p + "attn_norm.w").f32();
+    L.wq = &wf->get(p + "attn.q.w");
+    L.wk = &wf->get(p + "attn.k.w");
+    L.wv = &wf->get(p + "attn.v.w");
+    L.wo = &wf->get(p + "attn.o.w");
+    L.mlp_norm = wf->get(p + "mlp_norm.w").f32();
+    L.wgate = &wf->get(p + "mlp.gate.w");
+    L.wup = &wf->get(p + "mlp.up.w");
+    L.wdown = &wf->get(p + "mlp.down.w");
+  }
+
+  // Manual KV cache: [layer][pos][kv_dim] (GQA, so kv_dim < q_dim here).
+  std::vector<std::vector<float>> k_cache(c.n_layers, std::vector<float>(size_t(T) * kv_dim));
+  std::vector<std::vector<float>> v_cache(c.n_layers, std::vector<float>(size_t(T) * kv_dim));
+
+  std::vector<float> x(d), h(d), q(q_dim), v_pre(kv_dim), att(q_dim), proj(d), gate(d_ff), up(d_ff);
+  std::vector<float> scores(size_t(n_heads) * T);
+  std::vector<float> logits(c.vocab_size);
+
+  ErrorTracker err;
+  // Tolerances: f32 end-to-end against an independently-computed f32 HF reference, same
+  // methodology as Gpt2Reference above. TinyLlama is 22 layers (vs. GPT-2's 12) and wider
+  // (d_model 2048 vs 768, d_ff 5632 vs 3072), so summation-order drift in the matmuls
+  // accumulates further by the last layer; RoPE error also grows with position, but at
+  // these early positions (0-5) that term is negligible (~1e-6, see OpLevelReference's
+  // pos=2047 case for where it actually matters) -- depth, not RoPE, is what widens these
+  // tolerances relative to GPT-2's. Each value below is set from the measured worst case
+  // (see the worst-case summary this test prints), rounded up with a small margin for
+  // run-to-run noise (parallel reduction order in the F32 thread pool), not guessed:
+  //   embed 0, ln1 1.1e-5, ln2 8.1e-6, q 1.0e-5, k 2.0e-5, v 3.6e-6, attn_merged 4.9e-6,
+  //   gate 1.8e-5, up 1.7e-5, swiglu 3.3e-4, down 1.2e-4, resid1/resid2 1.2e-4,
+  //   norm_f 3.3e-4, logits 4.2e-5, shipped_logits 3.1e-5. Reproducible bit-for-bit across
+  //   repeated runs on this machine (checked 3x), so the margins below are not chasing
+  //   run-to-run thread-scheduling noise.
+  constexpr double kTolTiny = 5e-5;    // embed, ln1, ln2: small sums, O(1)-scale values
+  constexpr double kTolQkv = 5e-5;     // q, k, v: single d_model-wide matmul, pre-RoPE
+  constexpr double kTolAttn = 2e-5;    // attn_merged: RoPE + GQA attention wired together
+  constexpr double kTolMlp = 1e-3;     // gate/up/swiglu/down: wider matmuls (d_ff=5632)
+  constexpr double kTolResid = 1e-3;   // resid1/resid2/norm_f: accumulated over 22 blocks
+  constexpr double kTolLogits = 2e-4;  // logits, shipped_logits: 2048-wide matmul on top of 22 blocks' drift
+
+  for (int pos = 0; pos < T; ++pos) {
+    const int token = prompt[pos];
+    const float* te = tok_emb.f32() + size_t(token) * d;
+    std::copy(te, te + d, x.begin());
+    err.check("embed", x, ref.row("embed", pos, d), kTolTiny, "pos=" + std::to_string(pos));
+
+    for (int l = 0; l < c.n_layers; ++l) {
+      const Layer& L = layers[l];
+      const std::string lp = "l" + std::to_string(l) + ".";
+      const std::string where = "layer=" + std::to_string(l) + " pos=" + std::to_string(pos);
+
+      rmsnorm(h.data(), x.data(), L.attn_norm, d, c.norm_eps);
+      err.check("ln1", h, ref.row(lp + "ln1", pos, d), kTolTiny, where);
+
+      linear(q.data(), h.data(), *L.wq, nullptr, d, q_dim);
+      err.check("q", q, ref.row(lp + "q", pos, q_dim), kTolQkv, where);
+
+      float* kc = &k_cache[l][size_t(pos) * kv_dim];
+      linear(kc, h.data(), *L.wk, nullptr, d, kv_dim);
+      err.check("k", std::vector<float>(kc, kc + kv_dim), ref.row(lp + "k", pos, kv_dim), kTolQkv, where);
+
+      linear(v_pre.data(), h.data(), *L.wv, nullptr, d, kv_dim);
+      err.check("v", v_pre, ref.row(lp + "v", pos, kv_dim), kTolQkv, where);
+      std::copy(v_pre.begin(), v_pre.end(), v_cache[l].begin() + size_t(pos) * kv_dim);
+
+      // q/k above are captured PRE-RoPE (matching the HF q_proj/k_proj hook); rope() is
+      // applied in place now, exactly as src/llama.cpp does, so attn_merged below
+      // exercises RoPE and GQA attention together (see the file header comment).
+      rope(q.data(), n_heads, head_dim, pos, c.rope_theta);
+      rope(kc, n_kv_heads, head_dim, pos, c.rope_theta);
+
+      attention(att.data(), q.data(), k_cache[l].data(), v_cache[l].data(), pos + 1, n_heads, n_kv_heads,
+                head_dim, scores.data());
+      err.check("attn_merged", att, ref.row(lp + "attn_merged", pos, q_dim), kTolAttn, where);
+
+      linear(proj.data(), att.data(), *L.wo, nullptr, q_dim, d);
+      add_inplace(x.data(), proj.data(), d);
+      err.check("resid1", x, ref.row(lp + "resid1", pos, d), kTolResid, where);
+
+      rmsnorm(h.data(), x.data(), L.mlp_norm, d, c.norm_eps);
+      err.check("ln2", h, ref.row(lp + "ln2", pos, d), kTolTiny, where);
+
+      linear(gate.data(), h.data(), *L.wgate, nullptr, d, d_ff);
+      err.check("gate", gate, ref.row(lp + "gate", pos, d_ff), kTolMlp, where);
+
+      linear(up.data(), h.data(), *L.wup, nullptr, d, d_ff);
+      err.check("up", up, ref.row(lp + "up", pos, d_ff), kTolMlp, where);
+
+      silu_mul(gate.data(), up.data(), d_ff);
+      err.check("swiglu", gate, ref.row(lp + "swiglu", pos, d_ff), kTolMlp, where);
+
+      linear(proj.data(), gate.data(), *L.wdown, nullptr, d_ff, d);
+      err.check("down", proj, ref.row(lp + "down", pos, d), kTolMlp, where);
+      add_inplace(x.data(), proj.data(), d);
+      err.check("resid2", x, ref.row(lp + "resid2", pos, d), kTolResid, where);
+    }
+
+    rmsnorm(h.data(), x.data(), norm_f_w, d, c.norm_eps);
+    err.check("norm_f", h, ref.row("norm_f", pos, d), kTolResid, "pos=" + std::to_string(pos));
+
+    linear(logits.data(), h.data(), lm_head, nullptr, d, c.vocab_size);
+    err.check("logits", logits, ref.row("logits", pos, c.vocab_size), kTolLogits, "pos=" + std::to_string(pos));
+  }
+
+  // Also exercise the actual shipped path (load_model() + Model::forward(), src/llama.cpp)
+  // against the same HF logits, closing the gap CLAUDE.md flags: TinyLlama's real weights
+  // run through the real engine wiring, not just this file's independent reproduction.
+  // Done before print_summary() so shipped_logits shows up in the printed table too.
+  {
+    auto model = load_model(weights_path.string(), 64);
+    const float* model_logits = nullptr;
+    for (int pos = 0; pos < T; ++pos) model_logits = model->forward(prompt[pos], pos);
+    std::vector<float> got(model_logits, model_logits + c.vocab_size);
+    err.check("shipped_logits", got, ref.row("logits", T - 1, c.vocab_size), kTolLogits,
+              "pos=" + std::to_string(T - 1));
+  }
+
+  err.print_summary();
+}
+
+// ---------------------------------------------------------------------------
+// 3. Op-level references: fixed-seed random inputs, HF/torch reference implementations.
 
 TEST(OpLevelReference, MatchesHuggingFaceAndTorch) {
   const fs::path ref_dir = fs::path(test::models_dir()) / "ref" / "ops";

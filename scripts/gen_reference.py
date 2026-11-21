@@ -17,12 +17,14 @@ apples-to-apples rather than float32-vs-float64.
 
 Output layout (gitignored: lives under models/, and models/ is already gitignored):
 
-    models/ref/gpt2/manifest.txt   "<name> <dim0> [dim1 ...]" per line, '#' comments
-    models/ref/gpt2/<name>.f32     flat row-major float32, little-endian, no header
+    models/ref/gpt2/manifest.txt       "<name> <dim0> [dim1 ...]" per line, '#' comments
+    models/ref/gpt2/<name>.f32         flat row-major float32, little-endian, no header
+    models/ref/tinyllama/manifest.txt
+    models/ref/tinyllama/<name>.f32
     models/ref/ops/manifest.txt
     models/ref/ops/<name>.f32
 
-Two independent things are dumped:
+Three independent things are dumped:
 
 1. gen_gpt2_reference(): runs real openai-community/gpt2 weights (models/gpt2, the same
    HF dir tinyllm-convert reads) through HF's GPT2Model on a fixed 5-token prompt and
@@ -41,7 +43,26 @@ Two independent things are dumped:
    by position, to tinyllm's one-token-at-a-time KV-cache forward: causal attention only
    lets position p see positions <= p either way.
 
-2. gen_op_level_reference(): fixed-seed random inputs run through HF/torch's *own*
+2. gen_tinyllama_reference(): runs real TinyLlama-1.1B-Chat-v1.0 weights (models/tinyllama,
+   the same HF dir tinyllm-convert reads) through HF's LlamaForCausalLM on a fixed 6-token
+   id sequence (BOS + 5-token prompt, see TINYLLAMA_FULL_IDS below) and captures the
+   post-op intermediate at every point the hand-rolled C++ reproduction in
+   TinyLlamaReference.ElementWiseMatchesHuggingFace also computes one: the embedding, each
+   layer's input_layernorm/q_proj/k_proj/v_proj (all PRE-RoPE)/merged-GQA-attention-output
+   (POST-RoPE, so RoPE+attention are exercised together there, not isolated)/post-attention
+   residual/post_attention_layernorm/gate_proj/up_proj/SwiGLU-gate/down_proj/post-mlp
+   residual, the final norm, and the logits. Captured via forward hooks on the real
+   submodules, run with attn_implementation="eager".
+
+   Fixed prompt: "The capital of France is" -> SentencePiece ids [450, 7483, 310, 3444,
+   338] with BOS (id 1) prepended -> TINYLLAMA_FULL_IDS = [1, 450, 7483, 310, 3444, 338].
+   tinyllm's Tokenizer::encode() never adds BOS (the CLI prepends it for LLaMA); see the
+   module comment above TINYLLAMA_PROMPT_IDS for how this id list is cross-checked against
+   the engine's actual SentencePiece output. As with GPT-2 above, one batched causal
+   forward over the full 6-token sequence is mathematically identical, position by
+   position, to tinyllm's one-token-at-a-time KV-cache forward.
+
+3. gen_op_level_reference(): fixed-seed random inputs run through HF/torch's *own*
    reference implementations of each named op, independent of the GPT-2 forward above:
      - LayerNorm:    torch.nn.functional.layer_norm
      - GELU:         transformers.activations.NewGELUActivation (GPT-2's "gelu_new")
@@ -68,6 +89,7 @@ import torch.nn.functional as F
 REPO = Path(__file__).resolve().parent.parent
 MODELS = REPO / "models"
 GPT2_DIR = MODELS / "gpt2"
+TINYLLAMA_DIR = MODELS / "tinyllama"
 REF_DIR = MODELS / "ref"
 
 torch.set_grad_enabled(False)
@@ -201,6 +223,144 @@ def gen_gpt2_reference():
     )
 
 
+# --------------------------------------------------------------------------- TinyLlama (real weights)
+
+# "The capital of France is", SentencePiece ids with no BOS (never added by tinyllm's
+# Tokenizer::encode -- see tinyllm/tokenizer.h and CLAUDE.md). The *authoritative* check
+# that this list is right is in tests/reference_pytorch_test.cpp: it calls the engine's
+# real SentencePiece encode() on this same string and ASSERT_EQs it against this exact
+# list before trusting anything downstream. The assert below is a secondary cross-check
+# using HF's tokenizer for this script's own sanity, not the source of truth -- if the two
+# ever disagree, trust the C++ assertion and repin this list (and TINYLLAMA_FULL_IDS) to
+# whatever the engine's SentencePiece actually produces, never the other way around.
+TINYLLAMA_BOS_ID = 1  # config.json bos_token_id, matches Config::bos_id in the .tllm header
+TINYLLAMA_PROMPT_IDS = [450, 7483, 310, 3444, 338]
+TINYLLAMA_FULL_IDS = [TINYLLAMA_BOS_ID] + TINYLLAMA_PROMPT_IDS  # what both HF and the engine run
+
+
+def gen_tinyllama_reference():
+    from transformers import AutoTokenizer, LlamaForCausalLM
+
+    if not (TINYLLAMA_DIR / "model.safetensors").exists():
+        print(f"skip: {TINYLLAMA_DIR} has no model.safetensors", file=sys.stderr)
+        return
+
+    # Secondary cross-check only (see module-level comment on TINYLLAMA_PROMPT_IDS above).
+    # This venv has no `sentencepiece` pip package, so AutoTokenizer falls back to the
+    # fast (tokenizers-crate) backend built from tokenizer.json rather than true
+    # SentencePiece; that backend is a lossless conversion of the same tokenizer.model
+    # for plain ASCII text like this prompt, but it is not byte-for-byte the same code
+    # path the engine runs. The engine's own SentencePiece encode() in the C++ test is
+    # what actually gates the comparison.
+    tok = AutoTokenizer.from_pretrained(str(TINYLLAMA_DIR))
+    ids = tok.encode("The capital of France is", add_special_tokens=False)
+    print(f"tinyllama HF tokenizer ids (no BOS, cross-check only): {ids}")
+    assert ids == TINYLLAMA_PROMPT_IDS, f"tokenizer mismatch: {ids} != {TINYLLAMA_PROMPT_IDS}"
+    print(f"tinyllama full id sequence fed to HF (BOS + prompt): {TINYLLAMA_FULL_IDS}")
+
+    model = LlamaForCausalLM.from_pretrained(str(TINYLLAMA_DIR), attn_implementation="eager")
+    model.eval().to(torch.float32)
+    lm = model.model  # LlamaModel
+    n_layers = len(lm.layers)
+    d = model.config.hidden_size
+    n_heads = model.config.num_attention_heads
+    n_kv_heads = model.config.num_key_value_heads
+    head_dim = getattr(model.config, "head_dim", None) or d // n_heads
+    d_ff = model.config.intermediate_size
+
+    captured = {}
+
+    def save(name):
+        def hook(_module, _inp, out):
+            captured[name] = out[0] if isinstance(out, tuple) else out
+
+        return hook
+
+    def save_input(name):
+        def hook(_module, inp):
+            captured[name] = inp[0]
+
+        return hook
+
+    handles = []
+    for i, layer in enumerate(lm.layers):
+        p = f"l{i}."
+        handles.append(layer.input_layernorm.register_forward_hook(save(p + "ln1")))
+        handles.append(layer.self_attn.q_proj.register_forward_hook(save(p + "q")))
+        handles.append(layer.self_attn.k_proj.register_forward_hook(save(p + "k")))
+        handles.append(layer.self_attn.v_proj.register_forward_hook(save(p + "v")))
+        # Pre-hook on o_proj captures its input = RoPE'd GQA attention output, heads
+        # merged back to [T, n_heads*head_dim], before the output projection. This is
+        # the one point where RoPE and GQA attention are exercised but not isolated;
+        # both are already checked standalone (with synthetic data) by OpLevelReference,
+        # so this hook's job is to catch the *wiring* of rope()+attention() together, not
+        # to re-derive either op from scratch.
+        handles.append(layer.self_attn.o_proj.register_forward_pre_hook(save_input(p + "attn_merged")))
+        handles.append(layer.self_attn.o_proj.register_forward_hook(save(p + "attn_proj")))
+        handles.append(layer.post_attention_layernorm.register_forward_hook(save(p + "ln2")))
+        handles.append(layer.mlp.gate_proj.register_forward_hook(save(p + "gate")))
+        handles.append(layer.mlp.up_proj.register_forward_hook(save(p + "up")))
+        handles.append(layer.mlp.down_proj.register_forward_hook(save(p + "down")))
+        # Raw decoder-layer output, independent of however output_hidden_states chooses
+        # to represent the last layer -- same cross-check pattern as gen_gpt2_reference.
+        handles.append(layer.register_forward_hook(save(p + "block_out")))
+
+    input_ids = torch.tensor([TINYLLAMA_FULL_IDS], dtype=torch.long)
+    out = model(input_ids, output_hidden_states=True)
+    logits = out.logits[0]  # [T, vocab]
+    hidden_states = out.hidden_states  # tuple(len n_layers+1); [0] is the embedding, [-1] normed.
+
+    for h in handles:
+        h.remove()
+
+    d_out = Dumper(REF_DIR / "tinyllama")
+    T = len(TINYLLAMA_FULL_IDS)
+    embed = lm.embed_tokens(input_ids)[0]  # [T, d], no positional embedding table for LLaMA
+    d_out.add("embed", embed)
+    err = (embed - hidden_states[0][0]).abs().max().item()
+    assert err < 1e-6, f"embed vs hidden_states[0] mismatch, max diff {err}"
+
+    block_in = embed
+    for i in range(n_layers):
+        p = f"l{i}."
+        d_out.add(p + "ln1", captured[p + "ln1"][0])
+        d_out.add(p + "q", captured[p + "q"][0])
+        d_out.add(p + "k", captured[p + "k"][0])
+        d_out.add(p + "v", captured[p + "v"][0])
+        d_out.add(p + "attn_merged", captured[p + "attn_merged"][0])
+        # resid1 = input to this block + attn contribution (pre-residual o_proj output)
+        resid1 = block_in + captured[p + "attn_proj"][0]
+        d_out.add(p + "resid1", resid1)
+        d_out.add(p + "ln2", captured[p + "ln2"][0])
+        d_out.add(p + "gate", captured[p + "gate"][0])
+        d_out.add(p + "up", captured[p + "up"][0])
+        # SwiGLU gate: silu(gate_proj) * up_proj. LlamaMLP.forward computes this inline
+        # (no standalone module to hook), so it's recomputed here the same way resid1/
+        # resid2 are -- from captured sub-module outputs plus a known closed-form op.
+        swiglu = F.silu(captured[p + "gate"][0]) * captured[p + "up"][0]
+        d_out.add(p + "swiglu", swiglu)
+        d_out.add(p + "down", captured[p + "down"][0])
+        resid2 = resid1 + captured[p + "down"][0]
+        d_out.add(p + "resid2", resid2)
+        want = captured[p + "block_out"][0]
+        err = (resid2 - want).abs().max().item()
+        assert err < 1e-4, f"layer {i}: resid2 vs block hook output mismatch, max diff {err}"
+        block_in = resid2
+    norm_f_out = lm.norm(block_in)
+    d_out.add("norm_f", norm_f_out)
+    err = (norm_f_out - hidden_states[-1][0]).abs().max().item()
+    assert err < 1e-4, f"norm_f vs hidden_states[-1] mismatch, max diff {err}"
+    d_out.add("logits", logits)
+    d_out.write_manifest(
+        f"TinyLlama-1.1B-Chat-v1.0, HF weights at {TINYLLAMA_DIR}, full id sequence (BOS + prompt) "
+        f"{TINYLLAMA_FULL_IDS}, attn_implementation=eager, float32, T={T} d={d} n_layers={n_layers} "
+        f"n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} d_ff={d_ff}. "
+        f"q/k are PRE-RoPE (raw q_proj/k_proj output); attn_merged is POST-RoPE+GQA-attention, "
+        f"pre-o_proj, so RoPE and attention are exercised together there, not isolated (see "
+        f"OpLevelReference / ops_test.cpp for isolated RoPE and attention checks)."
+    )
+
+
 # --------------------------------------------------------------------------- op-level references
 
 def ref_attention(q, k, v, n_pos, H, KVH, hd):
@@ -306,6 +466,7 @@ def main():
     import transformers
     print(f"transformers {transformers.__version__}")
     gen_gpt2_reference()
+    gen_tinyllama_reference()
     gen_op_level_reference()
 
 
