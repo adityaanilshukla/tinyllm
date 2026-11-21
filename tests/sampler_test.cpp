@@ -1,7 +1,7 @@
-#include <gtest/gtest.h>
-
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <gtest/gtest.h>
 #include <numeric>
 #include <set>
 #include <vector>

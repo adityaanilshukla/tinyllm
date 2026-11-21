@@ -1,10 +1,11 @@
 // Full forward passes of tiny random GPT-2 and LLaMA models, written to .tllm and run
 // through load_model(), against naive double-precision reference implementations that
 // follow the HF modeling code. Needs no model files.
-#include <gtest/gtest.h>
-
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
+#include <gtest/gtest.h>
 #include <map>
 #include <stdexcept>
 #include <string>

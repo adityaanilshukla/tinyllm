@@ -1,8 +1,9 @@
 // softmax, layernorm, GELU, add, attention (MHA + GQA), rmsnorm, RoPE, SwiGLU against
 // naive double-precision references.
-#include <gtest/gtest.h>
-
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <gtest/gtest.h>
 #include <limits>
 #include <stdexcept>
 #include <tuple>

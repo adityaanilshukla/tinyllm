@@ -55,17 +55,17 @@
 //   ./build/tinyllm-convert models/tinyllama models/tinyllama-q8.tllm --quant q8
 //   ./build/tinyllm-convert models/tinyllama models/tinyllama-q4.tllm --quant q4
 //   models/.venv-ref/bin/python scripts/gen_reference.py
-#include <gtest/gtest.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <gtest/gtest.h>
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>

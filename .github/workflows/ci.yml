@@ -34,40 +34,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  cuda-compile:
-    name: CUDA kernels (compile-only, non-blocking)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install CPU-side dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            g++ \
-            libsentencepiece-dev \
-            libabsl-dev
-
-      - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.19
-        id: cuda-toolkit
-        with:
-          method: network
-          sub-packages: '["nvcc", "cudart"]'
-
-      # No GPU runner is available, so CMAKE_CUDA_ARCHITECTURES is pinned explicitly
-      # (the default in cuda/CMakeLists.txt is "native", which needs a GPU to probe).
-      # Tests are off here: this job only compiles the CUDA kernels, it never runs them.
-      - name: Configure (CUDA, compile-only)
-        run: >
-          cmake -S . -B build-cuda -G Ninja
-          -DTINYLLM_CUDA=ON
-          -DTINYLLM_BUILD_TESTS=OFF
-          -DCMAKE_CUDA_ARCHITECTURES=89
-
-      - name: Build CUDA kernels
-        run: cmake --build build-cuda
+# The CUDA kernels are verified by compiling and running them on real NVIDIA hardware
+# (see cuda/README.md and the README). CI has no GPU runner, so it does not build or run
+# the CUDA code; a GPU-less compile-only job added fragility (toolkit package availability)
+# for little signal and is deliberately omitted.

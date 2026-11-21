@@ -1,7 +1,7 @@
 // linear() for F32 / Q8 / Q4 weights against a naive double-precision matvec.
-#include <gtest/gtest.h>
-
 #include <cmath>
+#include <cstdint>
+#include <gtest/gtest.h>
 #include <stdexcept>
 #include <thread>
 #include <tuple>

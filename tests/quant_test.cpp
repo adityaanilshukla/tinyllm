@@ -1,8 +1,9 @@
 // Q8/Q4 block quantization: round-trip error bounds and the exact on-disk layout.
-#include <gtest/gtest.h>
-
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <gtest/gtest.h>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
