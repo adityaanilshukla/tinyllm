@@ -1,0 +1,41 @@
+# Source for docs/architecture.png. Rendered with D2 (https://d2lang.com):
+#   d2 --theme 0 --layout dagre --pad 20 docs/architecture.d2 docs/architecture.svg
+# then rasterized to PNG at 2x (load the SVG in a headless browser and screenshot,
+# or use any SVG-to-PNG tool). Edit this file and re-render to update the diagram.
+
+direction: down
+
+model: Once per model {
+  direction: right
+  hf: "HuggingFace folder\nconfig.json · model.safetensors\nvocab.json or tokenizer.model"
+  conv: "tinyllm-convert\nmaps names, fixes layout\nbf16 to f32, optional q8 / q4"
+  tllm: "model.tllm\nheader + tensor index\n64-byte aligned weights"
+  hf -> conv -> tllm
+}
+
+token: Once per token {
+  direction: right
+  tok: "Tokenizer\nGPT-2 BPE or SentencePiece"
+  fwd: "forward(token, pos)\nGPT-2 or LLaMA layers\none token at a time"
+  samp: "Sampler\ntemperature · top-k · top-p"
+  out: "Streamed text\nstops at EOS"
+  tok -> fwd: ids
+  fwd -> samp: logits
+  samp -> out
+}
+
+layer: Inside each layer {
+  direction: right
+  lin: "linear()\nf32 matvec · q8 / q4 int8 dot"
+  attn: "attention()\nMHA or GQA over the KV cache"
+  norm: "norms & RoPE\nLayerNorm, GELU, RMSNorm, SwiGLU"
+}
+
+cuda: "CUDA kernels\ntiled GEMM · fused attention\nLayerNorm · softmax\nbenchmarked vs cuBLAS"
+
+model.tllm -> token.fwd: weights, mmapped
+token.fwd -> layer: each layer
+layer -> cuda
+
+token.fwd.style: { fill: "#dbeafe"; stroke: "#2563eb" }
+cuda.style: { fill: "#f0fdf4"; stroke: "#15803d"; stroke-dash: 4 }
