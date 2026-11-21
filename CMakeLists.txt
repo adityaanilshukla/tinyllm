@@ -18,10 +18,22 @@ pkg_check_modules(SENTENCEPIECE REQUIRED IMPORTED_TARGET sentencepiece)
 # packages (e.g. Ubuntu's libsentencepiece-dev) may not ship absl_status.pc at all.
 pkg_check_modules(ABSL_STATUS IMPORTED_TARGET absl_status)
 
+# The pkg-config imported target reliably supplies the include dirs, but some distro
+# .pc files (notably Ubuntu's libsentencepiece-dev) do not put -lsentencepiece on the
+# default, non-static link line, so the imported target alone leaves the symbols
+# undefined at link time. Locate the library explicitly and link it as well.
+find_library(SENTENCEPIECE_LIBRARY NAMES sentencepiece
+  HINTS ${SENTENCEPIECE_LIBDIR} ${SENTENCEPIECE_LIBRARY_DIRS})
+message(STATUS "sentencepiece: imported libs='${SENTENCEPIECE_LINK_LIBRARIES}' "
+               "libdir='${SENTENCEPIECE_LIBDIR}' explicit lib='${SENTENCEPIECE_LIBRARY}'")
+
 file(GLOB TINYLLM_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
 add_library(tinyllm STATIC ${TINYLLM_SRC})
 target_include_directories(tinyllm PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(tinyllm PUBLIC PkgConfig::SENTENCEPIECE)
+if(SENTENCEPIECE_LIBRARY)
+  target_link_libraries(tinyllm PUBLIC ${SENTENCEPIECE_LIBRARY})
+endif()
 if(ABSL_STATUS_FOUND)
   target_link_libraries(tinyllm PUBLIC PkgConfig::ABSL_STATUS)
 endif()
