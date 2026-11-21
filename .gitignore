@@ -11,9 +11,14 @@ models/
 *.bin
 *.gguf
 
-# Local, per-machine notes; never commit
+# Local, per-machine notes; never commit (ARCHITECTURE.md is the tracked design doc)
 project-scope.md
 todo.md
+CLAUDE.md
+
+# Python (reference-generation script)
+__pycache__/
+*.pyc
 
 # Editors and tools
 .cache/
