@@ -177,11 +177,7 @@ and do not depend on machine load.
 
 ## Architecture
 
-```
-HF checkpoint --(tinyllm-convert)--> model.tllm --(mmap, load_model)--> Model
-                                                                           |
-                               prompt --(tokenizer)--> ids --> forward(token, pos) --> logits --> sampler
-```
+![tinyllm architecture: convert a checkpoint once, then run the forward pass one token at a time through a pre-allocated KV cache](docs/architecture.png)
 
 - `tinyllm-convert` (`tools/convert.cpp`) runs once per model: maps HF names to canonical
   ones, converts f16/bf16 to f32, transposes GPT-2 Conv1D weights so every linear weight
