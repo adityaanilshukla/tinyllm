@@ -1,0 +1,26 @@
+# Build output (build/, build-cuda/, build-*/ ...)
+build*/
+cmake-build-*/
+compile_commands.json
+CMakeUserPresets.json
+
+# Models and converted weights
+models/
+*.tllm
+*.safetensors
+*.bin
+*.gguf
+
+# Local, per-machine notes; never commit
+project-scope.md
+todo.md
+
+# Editors and tools
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
