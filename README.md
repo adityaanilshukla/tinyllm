@@ -168,12 +168,20 @@ INT8 buys most of the memory win for a negligible accuracy cost; INT4 roughly ha
 memory again for a real, measurable perplexity increase. This is the "memory is the
 limit" story in numbers.
 
-**Throughput** is CPU-only and single-token (prefill and decode cost the same per token,
-since `Model::forward` processes one token at a time). On the host CPU (16 threads),
-TinyLlama-1.1B runs on the order of 15 to 40 tok/s depending on precision and GPT-2 small
-well above 100 tok/s. Run `./build/tinyllm-bench-cpu` on an idle machine for clean
-figures; the committed numbers above (memory, perplexity, correctness) are deterministic
-and do not depend on machine load.
+**Throughput** is CPU-only and single-token (`Model::forward` processes one token at a
+time, so prefill and decode cost the same per token). Greedy decode on the host CPU (16
+threads), tokens/sec:
+
+| Model | f32 | INT8 | INT4 |
+| --- | --- | --- | --- |
+| GPT-2 small | 146 | 187 | 207 |
+| TinyLlama-1.1B | 20 | 53 | 43 |
+
+Quantization *speeds up* generation here because inference is memory-bandwidth bound, not
+compute bound: smaller weights mean less memory traffic per token. INT8 is the sweet spot
+for TinyLlama, 2.7x faster than f32 and near-lossless; INT4's nibble unpacking costs back
+some of that speed. That is the same "memory is the limit" story the footprint and
+perplexity tables tell. Reproduce with `./build/tinyllm-bench-cpu`.
 
 ## Architecture
 
